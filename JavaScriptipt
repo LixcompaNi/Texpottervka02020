@@ -1,0 +1,282 @@
+// techsupport.js
+const express = require('express');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+const Database = require('better-sqlite3');
+const path = require('path');
+
+const app = express();
+const db = new Database('support.db');
+
+// Инициализация таблиц
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    role TEXT DEFAULT 'user'
+  );
+  CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT DEFAULT 'open',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+  CREATE TABLE IF NOT EXISTS replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(ticket_id) REFERENCES tickets(id),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+`);
+
+// Создать администратора, если нет
+const adminExists = db.prepare("SELECT id FROM users WHERE role = 'admin'").get();
+if (!adminExists) {
+  const hash = bcrypt.hashSync('admin123', 10);
+  db.prepare("INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, 'admin')")
+    .run('admin', 'admin@example.com', hash);
+  console.log('Администратор создан: admin@example.com / admin123');
+}
+
+// Настройки
+app.use(express.urlencoded({ extended: true }));
+app.use(session({
+  secret: 'change-me-to-something-secret',
+  resave: false,
+  saveUninitialized: false
+}));
+
+// Middleware
+function auth(req, res, next) {
+  if (!req.session.userId) return res.redirect('/login');
+  next();
+}
+function adminOnly(req, res, next) {
+  if (!req.session.userId) return res.redirect('/login');
+  const user = db.prepare('SELECT role FROM users WHERE id = ?').get(req.session.userId);
+  if (!user || user.role !== 'admin') return res.status(403).send('Доступ запрещён');
+  next();
+}
+
+// === СТРАНИЦЫ (встроенный HTML) ===
+
+// Регистрация
+app.get('/register', (req, res) => {
+  res.send(`
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>Регистрация</title>
+    <style>body{font-family:sans-serif;max-width:400px;margin:40px auto;}input,textarea,button{display:block;width:100%;margin:8px 0;padding:8px;}</style></head>
+    <body><h1>Регистрация</h1>
+    <form method="POST" action="/register">
+      <input name="username" placeholder="Логин" required>
+      <input name="email" type="email" placeholder="Email" required>
+      <input name="password" type="password" placeholder="Пароль" required>
+      <button>Зарегистрироваться</button>
+    </form>
+    <a href="/login">Уже есть аккаунт? Войти</a></body></html>
+  `);
+});
+
+app.post('/register', (req, res) => {
+  const { username, email, password } = req.body;
+  if (!username || !email || !password) return res.send('Все поля обязательны');
+  try {
+    const hash = bcrypt.hashSync(password, 10);
+    db.prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)').run(username, email, hash);
+    res.redirect('/login');
+  } catch (e) {
+    res.send('Ошибка: пользователь или email уже заняты. <a href="/register">Назад</a>');
+  }
+});
+
+// Вход
+app.get('/login', (req, res) => {
+  res.send(`
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>Вход</title>
+    <style>body{font-family:sans-serif;max-width:400px;margin:40px auto;}input,button{display:block;width:100%;margin:8px 0;padding:8px;}</style></head>
+    <body><h1>Вход</h1>
+    <form method="POST" action="/login">
+      <input name="email" type="email" placeholder="Email" required>
+      <input name="password" type="password" placeholder="Пароль" required>
+      <button>Войти</button>
+    </form>
+    <a href="/register">Создать аккаунт</a></body></html>
+  `);
+});
+
+app.post('/login', (req, res) => {
+  const { email, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  if (!user || !bcrypt.compareSync(password, user.password)) {
+    return res.send('Неверный email или пароль. <a href="/login">Попробовать снова</a>');
+  }
+  req.session.userId = user.id;
+  req.session.username = user.username;
+  if (user.role === 'admin') return res.redirect('/admin');
+  res.redirect('/dashboard');
+});
+
+app.get('/logout', (req, res) => {
+  req.session.destroy();
+  res.redirect('/login');
+});
+
+// Личный кабинет пользователя
+app.get('/dashboard', auth, (req, res) => {
+  const tickets = db.prepare('SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC').all(req.session.userId);
+  let ticketsHtml = tickets.map(t => `
+    <li><a href="/tickets/${t.id}">${t.title}</a> [${t.status}] <small>${t.created_at}</small></li>
+  `).join('');
+  if (!tickets.length) ticketsHtml = '<p>У вас пока нет тикетов.</p>';
+
+  res.send(`
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>Поддержка</title>
+    <style>body{font-family:sans-serif;max-width:600px;margin:40px auto;} a{margin-right:10px;}</style></head>
+    <body>
+      <h1>Добро пожаловать, ${req.session.username}!</h1>
+      <a href="/tickets/new">Создать обращение</a> | <a href="/logout">Выйти</a>
+      <h2>Ваши обращения</h2><ul>${ticketsHtml}</ul>
+    </body></html>
+  `);
+});
+
+// Создание тикета
+app.get('/tickets/new', auth, (req, res) => {
+  res.send(`
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>Новое обращение</title>
+    <style>body{font-family:sans-serif;max-width:500px;margin:40px auto;}input,textarea,button{display:block;width:100%;margin:8px 0;padding:8px;}</style></head>
+    <body>
+      <h1>Новое обращение</h1>
+      <form method="POST" action="/tickets/new">
+        <input name="title" placeholder="Тема" required>
+        <textarea name="description" placeholder="Опишите проблему"></textarea>
+        <button>Отправить</button>
+      </form>
+      <a href="/dashboard">Назад</a>
+    </body></html>
+  `);
+});
+
+app.post('/tickets/new', auth, (req, res) => {
+  const { title, description } = req.body;
+  if (!title) return res.send('Тема обязательна. <a href="/tickets/new">Назад</a>');
+  db.prepare('INSERT INTO tickets (user_id, title, description) VALUES (?, ?, ?)').run(req.session.userId, title, description);
+  res.redirect('/dashboard');
+});
+
+// Просмотр тикета и переписка
+app.get('/tickets/:id', auth, (req, res) => {
+  const ticket = db.prepare(`
+    SELECT tickets.*, users.username FROM tickets
+    JOIN users ON tickets.user_id = users.id
+    WHERE tickets.id = ?`).get(req.params.id);
+  if (!ticket) return res.status(404).send('Тикет не найден');
+
+  const currentUser = db.prepare('SELECT role FROM users WHERE id = ?').get(req.session.userId);
+  if (ticket.user_id !== req.session.userId && currentUser.role !== 'admin') {
+    return res.status(403).send('Доступ запрещён');
+  }
+
+  const replies = db.prepare(`
+    SELECT replies.*, users.username FROM replies
+    JOIN users ON replies.user_id = users.id
+    WHERE ticket_id = ? ORDER BY created_at ASC`).all(req.params.id);
+
+  let repliesHtml = replies.map(r => `
+    <div style="border:1px solid #ccc; padding:8px; margin:6px 0;">
+      <strong>${r.username}</strong> <small>${r.created_at}</small>
+      <p>${r.message}</p>
+    </div>
+  `).join('');
+  if (!replies.length) repliesHtml = '<p>Ответов пока нет.</p>';
+
+  const isAdmin = currentUser.role === 'admin';
+  const backLink = isAdmin ? '/admin' : '/dashboard';
+
+  res.send(`
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>${ticket.title}</title>
+    <style>body{font-family:sans-serif;max-width:600px;margin:40px auto;}textarea{width:100%;}</style></head>
+    <body>
+      <h1>${ticket.title}</h1>
+      <p>${ticket.description || 'Без описания'}</p>
+      <p>Статус: <strong>${ticket.status}</strong> | Автор: ${ticket.username}</p>
+      <h2>Переписка</h2>${repliesHtml}
+      <h3>Добавить ответ</h3>
+      <form method="POST" action="/tickets/${ticket.id}/reply">
+        <textarea name="message" required placeholder="Ваше сообщение..."></textarea>
+        <button>Ответить</button>
+      </form>
+      <p><a href="${backLink}">Назад</a></p>
+    </body></html>
+  `);
+});
+
+app.post('/tickets/:id/reply', auth, (req, res) => {
+  const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(req.params.id);
+  const currentUser = db.prepare('SELECT role FROM users WHERE id = ?').get(req.session.userId);
+  if (!ticket) return res.status(404).send('Тикет не найден');
+  if (ticket.user_id !== req.session.userId && currentUser.role !== 'admin') {
+    return res.status(403).send('Доступ запрещён');
+  }
+  const { message } = req.body;
+  if (!message) return res.redirect(`/tickets/${req.params.id}`);
+  db.prepare('INSERT INTO replies (ticket_id, user_id, message) VALUES (?, ?, ?)').run(req.params.id, req.session.userId, message);
+  res.redirect(`/tickets/${req.params.id}`);
+});
+
+// Админ-панель
+app.get('/admin', adminOnly, (req, res) => {
+  const tickets = db.prepare(`
+    SELECT tickets.*, users.username FROM tickets
+    JOIN users ON tickets.user_id = users.id
+    ORDER BY tickets.created_at DESC`).all();
+
+  let list = tickets.map(t => `
+    <li>
+      <a href="/tickets/${t.id}">${t.title}</a> от ${t.username} [${t.status}]
+      <form method="POST" action="/admin/tickets/${t.id}/toggle" style="display:inline">
+        <button>${t.status === 'open' ? 'Закрыть' : 'Открыть'}</button>
+      </form>
+    </li>
+  `).join('');
+  if (!list) list = '<p>Обращений нет.</p>';
+
+  res.send(`
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>Админ-панель</title>
+    <style>body{font-family:sans-serif;max-width:700px;margin:40px auto;}</style></head>
+    <body>
+      <h1>Панель администратора</h1>
+      <a href="/logout">Выйти</a>
+      <h2>Все обращения</h2><ul>${list}</ul>
+    </body></html>
+  `);
+});
+
+app.post('/admin/tickets/:id/toggle', adminOnly, (req, res) => {
+  const ticket = db.prepare('SELECT status FROM tickets WHERE id = ?').get(req.params.id);
+  if (!ticket) return res.status(404).send('Тикет не найден');
+  const newStatus = ticket.status === 'open' ? 'closed' : 'open';
+  db.prepare('UPDATE tickets SET status = ? WHERE id = ?').run(newStatus, req.params.id);
+  res.redirect('/admin');
+});
+
+// Главная
+app.get('/', (req, res) => {
+  if (req.session.userId) {
+    const user = db.prepare('SELECT role FROM users WHERE id = ?').get(req.session.userId);
+    return res.redirect(user.role === 'admin' ? '/admin' : '/dashboard');
+  }
+  res.redirect('/login');
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Сервер запущен: http://localhost:${PORT}`);
+});
